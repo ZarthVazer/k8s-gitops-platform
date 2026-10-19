@@ -1,0 +1,24 @@
+# Argo CD manages its own installation: upgrading Argo CD is a pull request
+# that changes the version in bootstrap/argocd/kustomization.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ZarthVazer/k8s-gitops-platform.git
+    targetRevision: main
+    path: bootstrap/argocd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: false # never let Argo CD delete parts of itself
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  KUSTOMIZE_VERSION: "5.8.3"
+  KUBECONFORM_VERSION: "0.8.0"
+  KIND_VERSION: "v0.33.0"
+
+jobs:
+  validate:
+    name: Validate manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install kustomize and kubeconform
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin kustomize
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar xz -C /usr/local/bin kubeconform
+
+      - name: Lint YAML
+        run: pip install --quiet yamllint==1.37.1 && yamllint .
+
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh
+
+      - name: Build and validate every kustomization
+        run: |
+          set -euo pipefail
+          for dir in $(find . -name kustomization.yaml -not -path './.git/*' -exec dirname {} \; | sort); do
+            echo "::group::$dir"
+            kustomize build "$dir" | kubeconform -strict -summary \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              -skip CustomResourceDefinition
+            echo "::endgroup::"
+          done
+
+      - name: Validate Argo CD applications
+        run: |
+          kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            apps/ bootstrap/root-app.yaml
+
+  e2e:
+    name: End-to-end on kind
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: ${{ env.KIND_VERSION }}
+          cluster_name: gitops-e2e
+
+      # Applications point at the main branch. In CI they must test *this* commit instead.
+      - name: Pin applications to the commit under test
+        run: |
+          sed -i "s/targetRevision: main/targetRevision: ${GITHUB_SHA}/" apps/*.yaml
+          grep -h "targetRevision" apps/*.yaml | sort | uniq -c
+
+      - name: Install Argo CD
+        run: |
+          kubectl apply --server-side --force-conflicts -k bootstrap/argocd
+          kubectl -n argocd rollout status deploy/argocd-server --timeout=5m
+          kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=5m
+          kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=5m
+
+      # The root app would read apps/ from main, so CI applies the pinned children directly
+      - name: Hand the cluster over to Argo CD
+        run: kubectl apply -f apps/
+
+      - name: Wait until every application is Synced and Healthy
+        run: bash scripts/wait-for-apps.sh 900
+
+      - name: Smoke test
+        run: |
+          kubectl top nodes   # proves metrics-server works
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl -n argocd get applications -o wide || true
+          for app in $(kubectl -n argocd get applications -o name); do
+            echo "::group::$app"
+            kubectl -n argocd get "$app" -o jsonpath='{.status.conditions}{"\n"}{.status.operationState.message}{"\n"}' || true
+            kubectl -n argocd get "$app" -o jsonpath='{range .status.resources[?(@.health.status!="Healthy")]}{.kind}/{.name}: {.health.status} {.health.message}{"\n"}{end}' || true
+            echo "::endgroup::"
+          done
+          kubectl get pods -A | grep -v -E 'Running|Completed' || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -40 || true

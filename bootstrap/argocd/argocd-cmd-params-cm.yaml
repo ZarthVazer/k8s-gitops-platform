@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cmd-params-cm
+data:
+  # TLS is terminated in front of Argo CD (port-forward locally, Gateway later)
+  server.insecure: "true"

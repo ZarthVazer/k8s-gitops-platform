@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+.idea/
+.vscode/
+# never commit plain secrets; only SealedSecrets
+*secret*.plain.yaml
